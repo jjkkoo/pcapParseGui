@@ -1,0 +1,62 @@
+{
+    "version": 1,
+    "disable_existing_loggers": false,
+    "formatters": {
+        "standard": {
+            "format": "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        }
+    },
+
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "level": "DEBUG",
+            "formatter": "standard",
+            "stream": "ext://sys.stdout"
+        },
+
+        "default": {
+            "class": "logging.handlers.TimedRotatingFileHandler",
+            "level": "INFO",
+            "formatter": "standard",
+            "filename": "log/pcapParseGui.log",
+            "encoding": "utf8"
+        },
+
+        "debug_file_handler": {
+            "class": "logging.handlers.TimedRotatingFileHandler",
+            "level": "ERROR",
+            "formatter": "standard",
+            "filename": "debug.log",
+            "encoding": "utf8"
+        }
+    },
+
+    "loggers": {
+        "MainThrd": {
+            "level": "DEBUG",
+            "handlers": ["default"],
+            "propagate": "no"
+        },
+        "pcmPlayProcess": {
+            "level": "DEBUG",
+            "handlers": ["default"],
+            "propagate": "no"
+        },
+        "pcmPlayThread": {
+            "level": "DEBUG",
+            "handlers": ["default"],
+            "propagate": "no"
+        },
+        "parserThr": {
+            "level": "DEBUG",
+            "handlers": ["default"],
+            "propagate": "no"
+        },
+        "decodeThr": {
+            "level": "DEBUG",
+            "handlers": ["default"],
+            "propagate": "no"
+        }
+    }
+}
