@@ -28,8 +28,8 @@ from matplotlib.backends.backend_qt4agg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 import matplotlib.pyplot as pl
 import numpy as np
-
-from multiprocessing import Process, Value, Array, Queue
+import multiprocessing
+from multiprocessing import Process, Value, Array, Queue, Lock, Manager, cpu_count
 from tempfile import TemporaryFile, NamedTemporaryFile
 
 # logging.disable(logging.CRITICAL)
@@ -608,26 +608,262 @@ class decodeH264Thread(QtCore.QThread):
         # pcmList[self.index][3] = ''
         self.logger.info('decodeH264Thread normal exit')
 
+class parserWorkerProcess(multiprocessing.Process):
+    def __init__(self, pcapData, packet_num, packetMark, percentInd, receiveJobLock, parserThrState, rtpHashMap, rtpHashMapLock, filename_arr, checkFilenameLock, filename_arr_count, globalSeq, maxTimeDeltaList, feedbackLock, logQueue, refreshProcessQ):
+        multiprocessing.Process.__init__(self)
+        self.pcapData = pcapData
+        self.packet_num = packet_num
+        self.packetMark = packetMark
+        self.percentInd = percentInd
+        self.receiveJobLock = receiveJobLock
+        self.parserThrState = parserThrState
+        self.rtpHashMap = rtpHashMap
+        self.rtpHashMapLock = rtpHashMapLock
+        self.filename_arr = filename_arr
+        self.checkFilenameLock = checkFilenameLock
+        self.filename_arr_count = filename_arr_count
+        self.globalSeq = globalSeq
+        self.maxTimeDeltaList = maxTimeDeltaList
+        self.feedbackLock = feedbackLock
+        self.logQueue = logQueue
+        self.refreshProcessQ = refreshProcessQ
+
+    def run(self):
+        pcap_packet_header = {}
+        EthernetII={}
+        ip={}
+        udp={}
+        rtp={}
+        while self.parserThrState.value and os.getppid():
+            with self.receiveJobLock:
+                # print('packetMark', self.packetMark.value, 'totalLength',len(self.pcapData))
+                if self.packetMark.value >= len(self.pcapData):
+                    # print(self.name, self.pid, 'exiting')
+                    return
+                pcap_packet_header['len'] = self.pcapData[self.packetMark.value + 12 : self.packetMark.value + 16]  
+                packet_len = struct.unpack('I',pcap_packet_header['len'])[0]
+                packetStart = self.packetMark.value
+                self.packetMark.value = self.packetMark.value + packet_len + 16
+                self.packet_num.value = self.packet_num.value + 1
+                if self.packetMark.value * 100 / len(self.pcapData) >= self.percentInd.value:
+                    self.percentInd.value = self.percentInd.value + 1
+                    self.refreshProcessQ.put(self.percentInd.value)
+                    print(self.refreshProcessQ.qsize())
+            pcap_packet_header['GMTtime'] = self.pcapData[packetStart : packetStart + 4]
+            pcap_packet_header['MicroTime'] = self.pcapData[packetStart + 4 : packetStart + 8]
+            pcap_packet_header['caplen'] = self.pcapData[packetStart + 8 : packetStart + 12]
+            timeStamp,= struct.unpack('<I',pcap_packet_header['GMTtime'])
+            microtime,= struct.unpack('<I',pcap_packet_header['MicroTime'])
+            timeArray = time.localtime(timeStamp)         
+            PacketTime = str(time.strftime("%Y-%m-%d %H:%M:%S", timeArray))+'.'+str(microtime)    
+
+            if packet_len>54:
+                #Ethernet II
+                EthernetII['addr_source']=self.pcapData[packetStart+16:packetStart+16+6]
+                EthernetII['addr_to']=self.pcapData[packetStart+16+6:packetStart+16+6+6]      
+                EthernetII['type']=self.pcapData[packetStart+16+6+6:packetStart+16+6+6+2]  
+                # self.logger.debug('EthernetII header: %s', EthernetII)
+                #ip
+                ip['version']=self.pcapData[packetStart+30:packetStart+31]
+                # print(packet_num)
+                ipversion,=struct.unpack('B',ip['version'])
+                if str(hex(ipversion))[2]=="4":
+                    #ipv4
+                    if str(hex(ipversion))[3]!="5":
+                        # self.logger.error('ip header length: %s, hard code for 20 only! packet number: %s',int(hex(ipversion)[3]) * 4, pcap_packet_header)
+                        continue
+                    ip['protocol']=self.pcapData[packetStart+30+9:packetStart+30+10]
+                    ip['addr_source']=self.pcapData[packetStart+30+12:packetStart+30+16]
+                    ip['addr_to']=self.pcapData[packetStart+30+16:packetStart+30+20]
+                    ip1,ip2,ip3,ip4=struct.unpack('4B',ip['addr_source'])
+                    ip_addr_from=str(ip1)+'.'+str(ip2)+'.'+str(ip3)+'.'+str(ip4)
+                    ip1,ip2,ip3,ip4=struct.unpack('4B',ip['addr_to'])
+                    ip_addr_to=str(ip1)+'.'+str(ip2)+'.'+str(ip3)+'.'+str(ip4)
+                    protocol,=struct.unpack('B',ip['protocol'])
+                    # self.logger.debug('ipv4 header: %s', ip)
+                    if protocol==17:
+                        #udp
+                        udp['source_port']=self.pcapData[packetStart+50:packetStart+50+2]
+                        udp['dest_port']=self.pcapData[packetStart+50+2:packetStart+50+4]
+                        udp['length']=struct.unpack('>H', self.pcapData[packetStart+50+4:packetStart+50+6])[0]
+                        port1,=struct.unpack('>H',udp['source_port'])
+                        port2,=struct.unpack('>H',udp['dest_port'])
+                        # self.logger.debug('udp header: %s', udp)
+#                       if port1>10000 and 31000<=port2<=31050 or port2>10000 and 31000<=port1<=31050:
+                        # if True:
+                        if port1>=10000 and port2>=10000 and len(self.pcapData[packetStart+58:packetStart+16+packet_len])>=15:
+                            #rtp
+                            rtp['first_two_byte']=self.pcapData[packetStart+58:packetStart+58+2]
+                            rtp['payload_type']=self.pcapData[packetStart+58+1:packetStart+58+2]
+                            payload_type,=struct.unpack('B',rtp['payload_type'])
+                            payload_type_num=int(payload_type&0b01111111)
+                            rtp['seq_number']=struct.unpack('>H', self.pcapData[packetStart+58+2:packetStart+58+4])[0]
+                            rtp['timestamp']=struct.unpack('>L', self.pcapData[packetStart+58+4:packetStart+58+8])[0]
+#                        rtp['SSRC']=struct.unpack('>I',self.pcapData[packetStart+58+8:packetStart+58+12])[0]
+                            rtp['SSRC']=binascii.hexlify(self.pcapData[packetStart+58+8:packetStart+58+12]).upper()
+                            rtp['payload']=self.pcapData[packetStart+58+12:packetStart+16+packet_len]
+                            # self.logger.debug('rtp header: %s', rtp)
+                            if 96<=payload_type_num<=127:
+                                with self.rtpHashMapLock:
+                                    if self.rtpHashMap.get(self.pcapData[packetStart+56:packetStart+58+12]) == None:
+                                        self.rtpHashMap[self.pcapData[packetStart+56:packetStart+58+12]] = ''
+                                        dupFlag=False
+                                    else:
+                                        dupFlag=True
+                                with self.feedbackLock:
+                                    if dupFlag == False:
+                                        j=0
+                                        existFlag = False
+                                        while j < self.filename_arr_count.value:
+#                                            print j,self.filename_arr_count7
+                                            if self.filename_arr[j][0]==ip_addr_from and self.filename_arr[j][1]==str(port1) and self.filename_arr[j][2]==ip_addr_to and self.filename_arr[j][3]==str(port2) and self.filename_arr[j][8]=='PT'+str(payload_type_num) and self.filename_arr[j][9]==rtp['SSRC']:
+                                                tempTimeDelta = datetime.datetime.strptime(PacketTime, "%Y-%m-%d %H:%M:%S.%f") - datetime.datetime.strptime(self.filename_arr[j][5], "%Y-%m-%d %H:%M:%S.%f")
+                                                if tempTimeDelta.total_seconds() > self.maxTimeDeltaList[j][0]:
+                                                    self.maxTimeDeltaList[j] = [tempTimeDelta.total_seconds(), rtp['seq_number']]
+                                                self.filename_arr[j][5]=PacketTime
+                                                self.filename_arr[j][6]=self.filename_arr[j][6]+1
+                                                self.filename_arr[j][7].append(rtp['payload'])
+                                                self.filename_arr[j][10].append(rtp['seq_number'])
+                                                self.filename_arr[j][11].append(rtp['timestamp'])
+                                                if rtp['seq_number'] + 65536 * self.globalSeq[j][2] > self.globalSeq[j][1]:
+                                                    self.globalSeq[j][1] = rtp['seq_number'] + 65536 * self.globalSeq[j][2]
+                                                elif rtp['seq_number'] + 65536 * self.globalSeq[j][2] < self.globalSeq[j][0]:
+                                                    self.globalSeq[j][0] = rtp['seq_number'] + 65536 * self.globalSeq[j][2]
+                                                if rtp['seq_number'] == 65535:
+                                                    self.globalSeq[j][2] = self.globalSeq[j][2] + 1
+                                                if len(self.filename_arr[j][10]) > 1 and not (self.filename_arr[j][10][-1] - self.filename_arr[j][10][-2] == 1 or (self.filename_arr[j][10][-2] == 65535 and self.filename_arr[j][10][-1] == 0)):
+                                                    self.globalSeq[j][3] = self.globalSeq[j][3] + 1
+                                                existFlag = True
+                                                # self.logger.debug('appending rtp payload to existing stream')
+                                            j=j+1
+                                        if existFlag == False:
+                                            self.filename_arr_count.value = self.filename_arr_count.value + 1
+                                            self.filename_arr.append([ip_addr_from, str(port1), ip_addr_to, str(port2), PacketTime, PacketTime, 1, [rtp['payload']], 'PT'+str(payload_type_num), rtp['SSRC'], [rtp['seq_number']], [rtp['timestamp']], 0])
+                                            # self.logger.debug('create new member in steam array')
+                                            self.globalSeq.append([rtp['seq_number'], rtp['seq_number'], 0, 0])
+                                            if rtp['seq_number'] == 65535:
+                                                self.globalSeq[j][2] = self.globalSeq[j][2] + 1
+                                            self.maxTimeDeltaList.append([0, rtp['seq_number']])
+                                    else:
+                                        j=0
+                                        while j < self.filename_arr_count.value:
+                                            if self.filename_arr[j][0]==ip_addr_from and self.filename_arr[j][1]==str(port1) and self.filename_arr[j][2]==ip_addr_to and self.filename_arr[j][3]==str(port2) and self.filename_arr[j][8]=='PT'+str(payload_type_num) and self.filename_arr[j][9]==rtp['SSRC']:
+                                                self.filename_arr[j][12] = self.filename_arr[j][12] + 1
+                                                # self.logger.debug('recognized as duplicated, stream dup counter++ and discarding')
+                                            j=j+1
+
+                else:
+                    ip['protocol']=self.pcapData[packetStart+30+6:packetStart+30+7]
+                    ip['addr_source']=self.pcapData[packetStart+30+8:packetStart+30+8+16]
+                    ip['addr_to']=self.pcapData[packetStart+30+8+16:packetStart+30+8+16+16]
+                    ip1,ip2,ip3,ip4,ip5,ip6,ip7,ip8=struct.unpack('>8H',ip['addr_source'])
+                    ip_addr_from=hex(ip1).replace('0x','')+':'+hex(ip2).replace('0x','')+':'+hex(ip3).replace('0x','')+':'+hex(ip4).replace('0x','')+':'+hex(ip5).replace('0x','')+':'+hex(ip6).replace('0x','')+':'+hex(ip7).replace('0x','')+':'+hex(ip8).replace('0x','')
+                    ip1,ip2,ip3,ip4,ip5,ip6,ip7,ip8=struct.unpack('>8H',ip['addr_to'])
+                    ip_addr_to=hex(ip1).replace('0x','')+':'+hex(ip2).replace('0x','')+':'+hex(ip3).replace('0x','')+':'+hex(ip4).replace('0x','')+':'+hex(ip5).replace('0x','')+':'+hex(ip6).replace('0x','')+':'+hex(ip7).replace('0x','')+':'+hex(ip8).replace('0x','')
+                    protocol,=struct.unpack('B',ip['protocol'])
+                    # self.logger.debug('ipv6 header: %s', ip)
+                    if protocol==17:
+                        #udp
+                        udp['source_port']=self.pcapData[packetStart+70:packetStart+70+2]
+                        udp['dest_port']=self.pcapData[packetStart+70+2:packetStart+70+4]
+                        udp['length']=struct.unpack('>H', self.pcapData[packetStart+70+4:packetStart+70+6])[0]
+                        port1,=struct.unpack('>H',udp['source_port'])
+                        port2,=struct.unpack('>H',udp['dest_port'])
+                        # self.logger.debug('udp header: %s', udp)
+#                        if port1>=10000 and 31000<=port2<=31050 or port2>=10000 and 31000<=port1<=31050:
+                        # if True:
+                        if port1>=10000 and port2>=10000 and len(self.pcapData[packetStart+78:packetStart+16+packet_len])>=15:
+                            #rtp
+                            rtp['first_two_byte']=self.pcapData[packetStart+78:packetStart+78+2]
+                            rtp['payload_type']=self.pcapData[packetStart+78+1:packetStart+78+2]
+                            payload_type,=struct.unpack('B',rtp['payload_type'])
+                            payload_type_num=int(payload_type&0b01111111)
+                            rtp['seq_number']=struct.unpack('>H', self.pcapData[packetStart+78+2:packetStart+78+4])[0]
+                            rtp['timestamp']=struct.unpack('>L', self.pcapData[packetStart+78+4:packetStart+78+8])[0]
+                            rtp['SSRC']=binascii.hexlify(self.pcapData[packetStart+78+8:packetStart+78+12]).upper()
+                            rtp['payload']=self.pcapData[packetStart+78+12:packetStart+16+packet_len]
+                            # self.logger.debug('rtp header: %s', rtp)
+                            if 96<=payload_type_num<=127:
+                                with self.rtpHashMapLock:
+                                    if self.rtpHashMap.get(self.pcapData[packetStart+76:packetStart+78+12]) == None:
+                                        self.rtpHashMap[self.pcapData[packetStart+76:packetStart+78+12]] = ''
+                                        dupFlag=False
+                                    else:
+                                        dupFlag=True
+                                with self.feedbackLock:
+                                    if dupFlag == False:
+                                        j=0
+                                        existFlag = False
+                                        while j < self.filename_arr_count.value:
+#                                            print j,self.filename_arr_count7
+                                            if self.filename_arr[j][0]==ip_addr_from and self.filename_arr[j][1]==str(port1) and self.filename_arr[j][2]==ip_addr_to and self.filename_arr[j][3]==str(port2) and self.filename_arr[j][8]=='PT'+str(payload_type_num) and self.filename_arr[j][9]==rtp['SSRC']:
+                                                tempTimeDelta = datetime.datetime.strptime(PacketTime, "%Y-%m-%d %H:%M:%S.%f") - datetime.datetime.strptime(self.filename_arr[j][5], "%Y-%m-%d %H:%M:%S.%f")
+                                                if tempTimeDelta.total_seconds() > self.maxTimeDeltaList[j][0]:
+                                                    self.maxTimeDeltaList[j] = [tempTimeDelta.total_seconds(), rtp['seq_number']]
+                                                self.filename_arr[j][5]=PacketTime
+                                                self.filename_arr[j][6]=self.filename_arr[j][6]+1
+                                                self.filename_arr[j][7].append(rtp['payload'])
+                                                self.filename_arr[j][10].append(rtp['seq_number'])
+                                                self.filename_arr[j][11].append(rtp['timestamp'])
+                                                if rtp['seq_number'] + 65536 * self.globalSeq[j][2] > self.globalSeq[j][1]:
+                                                    self.globalSeq[j][1] = rtp['seq_number'] + 65536 * self.globalSeq[j][2]
+                                                elif rtp['seq_number'] + 65536 * self.globalSeq[j][2] < self.globalSeq[j][0]:
+                                                    self.globalSeq[j][0] = rtp['seq_number'] + 65536 * self.globalSeq[j][2]
+                                                if rtp['seq_number'] == 65535:
+                                                    self.globalSeq[j][2] = self.globalSeq[j][2] + 1
+                                                if len(self.filename_arr[j][10]) > 1 and not (self.filename_arr[j][10][-1] - self.filename_arr[j][10][-2] == 1 or (self.filename_arr[j][10][-2] == 65535 and self.filename_arr[j][10][-1] == 0)):
+                                                    self.globalSeq[j][3] = self.globalSeq[j][3] + 1
+                                                existFlag = True
+                                                # self.logger.debug('appending rtp payload to existing stream')
+                                            j=j+1
+                                        if existFlag == False:
+                                            self.filename_arr_count.value = self.filename_arr_count.value + 1
+                                            self.filename_arr.append([ip_addr_from, str(port1), ip_addr_to, str(port2), PacketTime, PacketTime, 1, [rtp['payload']], 'PT'+str(payload_type_num), rtp['SSRC'], [rtp['seq_number']], [rtp['timestamp']], 0])
+                                            # self.logger.debug('create new member in steam array')
+                                            self.globalSeq.append([rtp['seq_number'], rtp['seq_number'], 0, 0])
+                                            if rtp['seq_number'] == 65535:
+                                                self.globalSeq[j][2] = self.globalSeq[j][2] + 1
+                                            self.maxTimeDeltaList.append([0, rtp['seq_number']])
+                                    else:
+                                        j=0
+                                        while j < self.filename_arr_count.value:
+                                            if self.filename_arr[j][0]==ip_addr_from and self.filename_arr[j][1]==str(port1) and self.filename_arr[j][2]==ip_addr_to and self.filename_arr[j][3]==str(port2) and self.filename_arr[j][8]=='PT'+str(payload_type_num) and self.filename_arr[j][9]==rtp['SSRC']:
+                                                self.filename_arr[j][12] = self.filename_arr[j][12] + 1
+                                                # self.logger.debug('recognized as duplicated, stream dup counter++ and discarding')
+                                            j=j+1
+
+
 class parsePcapThread(QtCore.QThread):
     def __init__(self, pcapFileName):
         QtCore.QThread.__init__(self)
         self.pcapFileName = pcapFileName
         self.logger = logging.getLogger('parserThr')
         self.logger.info('parser thread initiated')
-        self.runState = False
-
-    # def __del__(self):
-        # self.logger.info('parser thread __del__')
-        # self.wait()
+        self.parserThrState = Value('I', 0)
+        self.packet_num = Value('I', 0)
+        self.packetMark = Value('I', 0)
+        self.percentInd = Value('I', 0)
+        self.receiveJobLock = Lock()
+        self.mgr = multiprocessing.Manager()
+        self.rtpHashMap = self.mgr.dict()
+        self.rtpHashMapLock = Lock()
+        self.filename_arr_count = Value('I', 0)
+        self.filename_arr = self.mgr.list()
+        self.checkFilenameLock = Lock()
+        self.globalSeq = self.mgr.list()
+        self.maxTimeDeltaList = self.mgr.list()
+        self.feedbackLock = Lock()
+        self.logQueue = Queue()
+        self.refreshProcessQ = Queue()
 
     def stop(self):
-        self.runState = False
-        self.logger.info('getting stop event!')
+        self.parserThrState.value = 0
+        self.logger.info('parsePcapThread get stop event')
 
     def run(self):
         global parseResult
         global parseFailInfo
-        self.runState = True
+        self.parserThrState.value = 1
         fpcap = open(self.pcapFileName,'rb')
         string_data = fpcap.read()
         fpcap.close()
@@ -645,212 +881,48 @@ class parsePcapThread(QtCore.QThread):
         pcap_header['snaplen'] = string_data[16:20]
         pcap_header['linktype'] = string_data[20:24]
         self.logger.debug('pcap file header %s', pcap_header)
-        #pcap packet
-        step = 0
-        packet_num = 0
-        packet_data = []
-        pcap_packet_header = {}
-        EthernetII={}
-        ip={}
-        udp={}
-        rtp={}
-        rtpHashMap = {}
-        filename_arr=[]
-        globalSeq = [] # [[min, max, rollOver Count, wrongSeq],]
-        maxTimeDeltaList = [] # [[maxTimeDelta, maxTimeDelta rtp seq],]
-        i =24
-        filename_count=0
-        filename_arr_count=0
-        processInt=0
-        while(i<len(string_data)):
-            if not self.runState:
-                parseFailInfo = 'parsing cancelled'
-                return
-            if i*100/len(string_data)>=processInt:
-                processInt=processInt+1
-                self.emit(QtCore.SIGNAL('refreshProgressBar()'))
-            pcap_packet_header['GMTtime'] = string_data[i:i+4]
-            pcap_packet_header['MicroTime'] = string_data[i+4:i+8]
-            pcap_packet_header['caplen'] = string_data[i+8:i+12]
-            pcap_packet_header['len'] = string_data[i+12:i+16]
-            timeStamp,= struct.unpack('<I',pcap_packet_header['GMTtime'])
-            microtime,= struct.unpack('<I',pcap_packet_header['MicroTime'])
-            timeArray = time.localtime(timeStamp)         
-            PacketTime = str(time.strftime("%Y-%m-%d %H:%M:%S", timeArray))+'.'+str(microtime)         
-            packet_len = struct.unpack('I',pcap_packet_header['len'])[0]
-            each_packet_data = string_data[i+16:i+16+packet_len]
-            self.logger.debug('packet number: %s, pcap packet header: %s',packet_num, pcap_packet_header)
-            if packet_len>54:
-                #Ethernet II
-                EthernetII['addr_source']=string_data[i+16:i+16+6]
-                EthernetII['addr_to']=string_data[i+16+6:i+16+6+6]      
-                EthernetII['type']=string_data[i+16+6+6:i+16+6+6+2]  
-                self.logger.debug('EthernetII header: %s', EthernetII)
-                #ip
-                ip['version']=string_data[i+30:i+31]
-                # print(packet_num)
-                ipversion,=struct.unpack('B',ip['version'])
-                if str(hex(ipversion))[2]=="4":
-                    #ipv4
-                    if str(hex(ipversion))[3]!="5":
-                        self.logger.error('ip header length: %s, hard code for 20 only! packet number: %s',int(hex(ipversion)[3]) * 4, pcap_packet_header)
-                        continue
-                    ip['protocol']=string_data[i+30+9:i+30+10]
-                    ip['addr_source']=string_data[i+30+12:i+30+16]
-                    ip['addr_to']=string_data[i+30+16:i+30+20]
-                    ip1,ip2,ip3,ip4=struct.unpack('4B',ip['addr_source'])
-                    ip_addr_from=str(ip1)+'.'+str(ip2)+'.'+str(ip3)+'.'+str(ip4)
-                    ip1,ip2,ip3,ip4=struct.unpack('4B',ip['addr_to'])
-                    ip_addr_to=str(ip1)+'.'+str(ip2)+'.'+str(ip3)+'.'+str(ip4)
-                    protocol,=struct.unpack('B',ip['protocol'])
-                    self.logger.debug('ipv4 header: %s', ip)
-                    if protocol==17:
-                        #udp
-                        udp['source_port']=string_data[i+50:i+50+2]
-                        udp['dest_port']=string_data[i+50+2:i+50+4]
-                        udp['length']=struct.unpack('>H', string_data[i+50+4:i+50+6])[0]
-                        port1,=struct.unpack('>H',udp['source_port'])
-                        port2,=struct.unpack('>H',udp['dest_port'])
-                        self.logger.debug('udp header: %s', udp)
-#                       if port1>10000 and 31000<=port2<=31050 or port2>10000 and 31000<=port1<=31050:
-                        # if True:
-                        if port1>=10000 and port2>=10000 and len(string_data[i+58:i+16+packet_len])>=15:
-                            #rtp
-                            rtp['first_two_byte']=string_data[i+58:i+58+2]
-                            rtp['payload_type']=string_data[i+58+1:i+58+2]
-                            payload_type,=struct.unpack('B',rtp['payload_type'])
-                            payload_type_num=int(payload_type&0b01111111)
-                            rtp['seq_number']=struct.unpack('>H', string_data[i+58+2:i+58+4])[0]
-                            rtp['timestamp']=struct.unpack('>L', string_data[i+58+4:i+58+8])[0]
-#                        rtp['SSRC']=struct.unpack('>I',string_data[i+58+8:i+58+12])[0]
-                            rtp['SSRC']=binascii.hexlify(string_data[i+58+8:i+58+12]).upper()
-                            rtp['payload']=string_data[i+58+12:i+16+packet_len]
-                            self.logger.debug('rtp header: %s', rtp)
-                            if 96<=payload_type_num<=127:
-                                if rtpHashMap.get(string_data[i+56:i+58+12]) == None:
-                                    rtpHashMap[string_data[i+56:i+58+12]] = ''
-                                    existFlag=False
-                                    j=0
-                                    while j<filename_arr_count:
-#                                        print j,filename_arr_count
-                                        if filename_arr[j][0]==ip_addr_from and filename_arr[j][1]==str(port1) and filename_arr[j][2]==ip_addr_to and filename_arr[j][3]==str(port2) and filename_arr[j][8]=='PT'+str(payload_type_num) and filename_arr[j][9]==rtp['SSRC']:
-                                            tempTimeDelta = datetime.datetime.strptime(PacketTime, "%Y-%m-%d %H:%M:%S.%f") - datetime.datetime.strptime(filename_arr[j][5], "%Y-%m-%d %H:%M:%S.%f")
-                                            if tempTimeDelta.total_seconds() > maxTimeDeltaList[j][0]:
-                                                maxTimeDeltaList[j] = [tempTimeDelta.total_seconds(), rtp['seq_number']]
-                                            filename_arr[j][5]=PacketTime
-                                            filename_arr[j][6]=filename_arr[j][6]+1
-                                            filename_arr[j][7].append(rtp['payload'])
-                                            filename_arr[j][10].append(rtp['seq_number'])
-                                            filename_arr[j][11].append(rtp['timestamp'])
-                                            if rtp['seq_number'] + 65536 * globalSeq[j][2] > globalSeq[j][1]:
-                                                globalSeq[j][1] = rtp['seq_number'] + 65536 * globalSeq[j][2]
-                                            elif rtp['seq_number'] + 65536 * globalSeq[j][2] < globalSeq[j][0]:
-                                                globalSeq[j][0] = rtp['seq_number'] + 65536 * globalSeq[j][2]
-                                            if rtp['seq_number'] == 65535:
-                                                globalSeq[j][2] = globalSeq[j][2] + 1
-                                            if not (filename_arr[j][10][-1] - filename_arr[j][10][-2] == 1 or (filename_arr[j][10][-2] == 65535 and filename_arr[j][10][-1] == 0)):
-                                                globalSeq[j][3] = globalSeq[j][3] + 1
-                                            existFlag=True
-                                            self.logger.debug('appending rtp payload to existing stream')
-                                        j=j+1
-                                    if existFlag==False:
-                                        filename_arr_count=filename_arr_count+1
-                                        filename_arr.append([ip_addr_from, str(port1), ip_addr_to, str(port2), PacketTime, PacketTime, 1, [rtp['payload']], 'PT'+str(payload_type_num), rtp['SSRC'], [rtp['seq_number']], [rtp['timestamp']], 0])
-                                        self.logger.debug('create new member in steam array')
-                                        globalSeq.append([rtp['seq_number'], rtp['seq_number'], 0, 0])
-                                        if rtp['seq_number'] == 65535:
-                                            globalSeq[j][2] = globalSeq[j][2] + 1
-                                        maxTimeDeltaList.append([0, rtp['seq_number']])
-                                else:
-                                    j=0
-                                    while j<filename_arr_count:
-                                        if filename_arr[j][0]==ip_addr_from and filename_arr[j][1]==str(port1) and filename_arr[j][2]==ip_addr_to and filename_arr[j][3]==str(port2) and filename_arr[j][8]=='PT'+str(payload_type_num) and filename_arr[j][9]==rtp['SSRC']:
-                                            filename_arr[j][12] = filename_arr[j][12] + 1
-                                            self.logger.debug('recognized as duplicated, stream dup counter++ and discarding')
-                                        j=j+1
+        self.packetMark.value = 24
+        #                  pcapData,      packet_num,      packetMark,      percentInd,      receiveJobLock,      parserThrState,      rtpHashMap,      rtpHashMapLock,      filename_arr,      checkFilenameLock,      filename_arr_count,      globalSeq,      maxTimeDeltaList,      feedbackLock,      logQueue)
+        processArgs = (string_data, self.packet_num, self.packetMark, self.percentInd, self.receiveJobLock, self.parserThrState, self.rtpHashMap, self.rtpHashMapLock, self.filename_arr, self.checkFilenameLock, self.filename_arr_count, self.globalSeq, self.maxTimeDeltaList, self.feedbackLock, self.logQueue, self.refreshProcessQ)
+        processList = [parserWorkerProcess(*processArgs) for n in range(cpu_count())]
+        for p in processList:
+            p.daemon = True
+            p.start()
 
-                else:
-                    ip['protocol']=string_data[i+30+6:i+30+7]
-                    ip['addr_source']=string_data[i+30+8:i+30+8+16]
-                    ip['addr_to']=string_data[i+30+8+16:i+30+8+16+16]
-                    ip1,ip2,ip3,ip4,ip5,ip6,ip7,ip8=struct.unpack('>8H',ip['addr_source'])
-                    ip_addr_from=hex(ip1).replace('0x','')+':'+hex(ip2).replace('0x','')+':'+hex(ip3).replace('0x','')+':'+hex(ip4).replace('0x','')+':'+hex(ip5).replace('0x','')+':'+hex(ip6).replace('0x','')+':'+hex(ip7).replace('0x','')+':'+hex(ip8).replace('0x','')
-                    ip1,ip2,ip3,ip4,ip5,ip6,ip7,ip8=struct.unpack('>8H',ip['addr_to'])
-                    ip_addr_to=hex(ip1).replace('0x','')+':'+hex(ip2).replace('0x','')+':'+hex(ip3).replace('0x','')+':'+hex(ip4).replace('0x','')+':'+hex(ip5).replace('0x','')+':'+hex(ip6).replace('0x','')+':'+hex(ip7).replace('0x','')+':'+hex(ip8).replace('0x','')
-                    protocol,=struct.unpack('B',ip['protocol'])
-                    self.logger.debug('ipv6 header: %s', ip)
-                    if protocol==17:
-                        #udp
-                        udp['source_port']=string_data[i+70:i+70+2]
-                        udp['dest_port']=string_data[i+70+2:i+70+4]
-                        udp['length']=struct.unpack('>H', string_data[i+70+4:i+70+6])[0]
-                        port1,=struct.unpack('>H',udp['source_port'])
-                        port2,=struct.unpack('>H',udp['dest_port'])
-                        self.logger.debug('udp header: %s', udp)
-#                        if port1>=10000 and 31000<=port2<=31050 or port2>=10000 and 31000<=port1<=31050:
-                        # if True:
-                        if port1>=10000 and port2>=10000 and len(string_data[i+78:i+16+packet_len])>=15:
-                            #rtp
-                            rtp['first_two_byte']=string_data[i+78:i+78+2]
-                            rtp['payload_type']=string_data[i+78+1:i+78+2]
-                            payload_type,=struct.unpack('B',rtp['payload_type'])
-                            payload_type_num=int(payload_type&0b01111111)
-                            rtp['seq_number']=struct.unpack('>H', string_data[i+78+2:i+78+4])[0]
-                            rtp['timestamp']=struct.unpack('>L', string_data[i+78+4:i+78+8])[0]
-                            rtp['SSRC']=binascii.hexlify(string_data[i+78+8:i+78+12]).upper()
-                            rtp['payload']=string_data[i+78+12:i+16+packet_len]
-                            self.logger.debug('rtp header: %s', rtp)
-                            if 96<=payload_type_num<=127:
-                                if rtpHashMap.get(string_data[i+76:i+78+12]) == None:
-                                    rtpHashMap[string_data[i+76:i+78+12]] = ''
-                                    existFlag=False
-                                    j=0
-                                    while j<filename_arr_count:
-                                        if filename_arr[j][0]==ip_addr_from and filename_arr[j][1]==str(port1) and filename_arr[j][2]==ip_addr_to and filename_arr[j][3]==str(port2) and filename_arr[j][8]=='PT'+str(payload_type_num) and filename_arr[j][9]==rtp['SSRC']:
-                                            tempTimeDelta = datetime.datetime.strptime(PacketTime, "%Y-%m-%d %H:%M:%S.%f") - datetime.datetime.strptime(filename_arr[j][5], "%Y-%m-%d %H:%M:%S.%f")
-                                            if tempTimeDelta.total_seconds() > maxTimeDeltaList[j][0]:
-                                                maxTimeDeltaList[j] = [tempTimeDelta.total_seconds(), rtp['seq_number']]
-                                            filename_arr[j][5]=PacketTime
-                                            filename_arr[j][6]=filename_arr[j][6]+1
-                                            filename_arr[j][7].append(rtp['payload'])
-                                            filename_arr[j][10].append(rtp['seq_number'])
-                                            filename_arr[j][11].append(rtp['timestamp'])
-                                            if rtp['seq_number'] + 65536 * globalSeq[j][2] > globalSeq[j][1]:
-                                                globalSeq[j][1] = rtp['seq_number'] + 65536 * globalSeq[j][2]
-                                            elif rtp['seq_number'] + 65536 * globalSeq[j][2] < globalSeq[j][0]:
-                                                globalSeq[j][0] = rtp['seq_number'] + 65536 * globalSeq[j][2]
-                                            if rtp['seq_number'] == 65535:
-                                                globalSeq[j][2] = globalSeq[j][2] + 1
-                                            if not (filename_arr[j][10][-1] - filename_arr[j][10][-2] == 1 or (filename_arr[j][10][-2] == 65535 and filename_arr[j][10][-1] == 0)):
-                                                globalSeq[j][3] = globalSeq[j][3] + 1
-                                            existFlag=True
-                                            self.logger.debug('appending rtp payload to existing stream')
-                                        j=j+1
-                                    if existFlag==False:
-                                        filename_arr_count=filename_arr_count+1
-                                        filename_arr.append([ip_addr_from, str(port1), ip_addr_to, str(port2), PacketTime, PacketTime, 1, [rtp['payload']], 'PT'+str(payload_type_num), rtp['SSRC'], [rtp['seq_number']], [rtp['timestamp']], 0])
-                                        self.logger.debug('create new member in steam array')
-                                        globalSeq.append([rtp['seq_number'], rtp['seq_number'], 0, 0])
-                                        if rtp['seq_number'] == 65535:
-                                            globalSeq[j][2] = globalSeq[j][2] + 1
-                                        maxTimeDeltaList.append([0, rtp['seq_number']])
-                                else:
-                                    j=0
-                                    while j<filename_arr_count:
-                                        if filename_arr[j][0]==ip_addr_from and filename_arr[j][1]==str(port1) and filename_arr[j][2]==ip_addr_to and filename_arr[j][3]==str(port2) and filename_arr[j][8]=='PT'+str(payload_type_num) and filename_arr[j][9]==rtp['SSRC']:
-                                            filename_arr[j][12] = filename_arr[j][12] + 1
-                                            self.logger.debug('recognized as duplicated, stream dup counter++ and discarding')
-                                        j=j+1
-            i = i+ packet_len+16
-            packet_num+=1
-        for j in range(len(filename_arr)):
+        while self.parserThrState.value:
+            try:
+                print(self.refreshProcessQ.qsize())
+                aliveProcessCount = 0
+                for p in processList:
+                    if p.is_alive():
+                        # print(p.name, p.pid, ': alive')
+                        aliveProcessCount = aliveProcessCount + 1
+                # print('aliveProcessCount', aliveProcessCount)
+                if aliveProcessCount == 0:
+                    break
+                self.refreshProcessQ.get(block = False)
+                self.emit(QtCore.SIGNAL('refreshProgressBar()'))
+                self.logger.debug('parsePcapThread update progressbar +1')
+            except queue.Empty:
+                time.sleep(0.03)
+                continue
+            except Exception as e:
+                self.logger.error('parsePcapThread feedback get error', exc_info=True)
+
+        self.logger.info('pcmPlayer Thread normally exited')
+        self.logger.debug('pcmPlayer normal finished, thread enumerating: %s', [t.getName() for t in threading.enumerate()])
+
+
+        for j in range(len(self.filename_arr)):
             # print(globalSeq[j], filename_arr[j][6])
-            filename_arr[j].append(globalSeq[j][1] - globalSeq[j][0] + 1 - filename_arr[j][6])
-            filename_arr[j].append(globalSeq[j][3])
-            filename_arr[j].append(str(round(maxTimeDeltaList[j][0],3)) + '/' + str(maxTimeDeltaList[j][1]))
-            self.logger.debug('filename_arr[%s] max: %s, min: %s, total: %s', j, globalSeq[j][1], globalSeq[j][0], filename_arr[j][6])
-        parseResult = filename_arr
+            self.filename_arr[j].append(self.globalSeq[j][1] - self.globalSeq[j][0] + 1 - self.filename_arr[j][6])
+            self.filename_arr[j].append(self.globalSeq[j][3])
+            self.filename_arr[j].append(str(round(self.maxTimeDeltaList[j][0],3)) + '/' + str(self.maxTimeDeltaList[j][1]))
+            self.logger.debug('filename_arr[%s] max: %s, min: %s, total: %s', j, self.globalSeq[j][1], self.globalSeq[j][0], self.filename_arr[j][6])
+        parseResult = self.filename_arr
         self.logger.info('parser thread normal exit')
+        self.logger.debug('gc.get_count: %s', gc.get_count())
+        self.logger.debug('thread enumerating: %s', [t.getName() for t in threading.enumerate()])
 
 class MatplotlibWidget(QtGui.QWidget):
     def __init__(self, parent=None):
